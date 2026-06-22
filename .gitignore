@@ -1,0 +1,28 @@
+# --- Entornos virtuales de Python ---
+venv/
+.venv/
+env/
+
+# --- Caché de Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# --- Datos descargados / caché (se regeneran al ejecutar la app) ---
+data/
+
+# --- Backups locales ---
+*.bak
+
+# --- Artefactos de Windows / WSL ---
+*:Zone.Identifier
+
+# --- Secretos de Streamlit ---
+.streamlit/secrets.toml
+
+# --- Editores / sistema operativo ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

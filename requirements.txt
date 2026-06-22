@@ -1,0 +1,10 @@
+# Dependencias del Dashboard de Análisis y Predicción — Mundial 2026
+# Instalar con:  pip install -r requirements.txt
+#
+# El modelo Poisson/Dixon-Coles está implementado a mano sobre numpy, así que NO
+# se necesitan scipy ni statsmodels. La descarga del CSV usa la stdlib (urllib).
+
+streamlit>=1.32
+pandas>=2.0
+plotly>=5.18
+numpy>=1.24
