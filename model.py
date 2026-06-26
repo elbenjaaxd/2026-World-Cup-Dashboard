@@ -57,6 +57,24 @@ TOL = 1e-9               # tolerancia de convergencia
 _FACT = np.array([math.factorial(k) for k in range(MAX_GOALS + 1)], dtype=float)
 _GOALS = np.arange(MAX_GOALS + 1)
 
+# --- Tiros a puerta (ESTIMACIÓN) ---------------------------------------------
+# No existe una fuente gratuita y accesible de tiros para estos partidos (FotMob
+# bloqueó su API), así que estimamos los tiros a puerta a partir del xG:
+#     tiros_a_puerta ≈ xG / conversión
+# usando la tasa media de conversión tiro-a-puerta→gol del fútbol internacional
+# (~0.30 goles por tiro a puerta). Es una aproximación transparente, NO un dato
+# real, y así se etiqueta en la interfaz.
+SOT_CONVERSION = 0.30
+
+# --- Recomendaciones de apuestas ---------------------------------------------
+# 'Recomendado' = mayor CONFIANZA del modelo. No se comparan con cuotas de casas
+# de apuestas (no hay fuente gratuita), así que esto NO mide valor frente al
+# mercado, sino la probabilidad que el modelo asigna a cada selección.
+OVER_LINES = (0.5, 1.5, 2.5, 3.5, 4.5)  # líneas de Más/Menos goles
+CONF_MIN = 0.58       # probabilidad mínima del modelo para "recomendar" un pick
+TIER_ALTA = 0.70      # umbral de confianza alta
+TIER_MEDIA = 0.60     # umbral de confianza media (por debajo: especulativa)
+
 
 # =============================================================================
 #  1. DESCARGA Y PREPARACIÓN DEL CSV
@@ -247,6 +265,15 @@ def _poisson_pmf(lam: float) -> np.ndarray:
     return np.exp(-lam) * np.power(lam, _GOALS) / _FACT
 
 
+def _poisson_sf(lam: float, k: int) -> float:
+    """P(X >= k) para X ~ Poisson(lam). Se usa en las líneas de tiros a puerta."""
+    if k <= 0:
+        return 1.0
+    k = min(k, MAX_GOALS + 1)
+    cdf = float(np.sum(np.exp(-lam) * np.power(lam, _GOALS[:k]) / _FACT[:k]))
+    return float(min(1.0, max(0.0, 1.0 - cdf)))
+
+
 def predict_match(
     home: dict, away: dict, neutral: bool, ratings: Ratings
 ) -> dict:
@@ -283,6 +310,18 @@ def predict_match(
     p_draw = float(np.trace(matrix))
     p_away = float(matrix[idx[0] < idx[1]].sum())
 
+    # Mercados de goles derivados de la MISMA matriz (cálculo exacto):
+    #   * Más/Menos N goles  -> suma de las celdas con (local+visita) > N
+    #   * Ambos marcan (BTTS) -> suma de las celdas con local>=1 y visita>=1
+    totals = idx[0] + idx[1]
+    p_over = {ln: float(matrix[totals > ln].sum()) for ln in OVER_LINES}
+    p_btts = float(matrix[(idx[0] >= 1) & (idx[1] >= 1)].sum())
+
+    # Tiros a puerta estimados a partir del xG (ver SOT_CONVERSION). Son una
+    # estimación, no un dato real; sirven de media para una Poisson en los picks.
+    sot_home = lam_home / SOT_CONVERSION
+    sot_away = lam_away / SOT_CONVERSION
+
     # Marcador más probable (argmax de la matriz)
     i, j = np.unravel_index(np.argmax(matrix), matrix.shape)
     most_likely = {"home": int(i), "away": int(j), "prob": float(matrix[i, j])}
@@ -293,9 +332,169 @@ def predict_match(
         "p_home": p_home,
         "p_draw": p_draw,
         "p_away": p_away,
+        "p_over": p_over,
+        "p_btts": p_btts,
+        "sot_home": sot_home,
+        "sot_away": sot_away,
         "most_likely": most_likely,
         "matrix": matrix,
     }
+
+
+# =============================================================================
+#  3b. MERCADOS Y RECOMENDACIONES DE APUESTAS
+# =============================================================================
+#  A partir de la predicción de un partido elegimos la MEJOR selección del
+#  modelo en cada mercado (1X2, doble oportunidad, Más/Menos 2.5, ambos marcan
+#  y tiros a puerta) junto con su probabilidad. Las que superan `CONF_MIN` se
+#  consideran "recomendadas". Para los partidos ya jugados podemos GRADUAR esos
+#  picks contra el resultado real y enseñar un histórico de aciertos.
+# -----------------------------------------------------------------------------
+def _tier(p: float) -> str:
+    """Etiqueta de confianza de un pick según su probabilidad."""
+    if p >= TIER_ALTA:
+        return "Alta"
+    if p >= TIER_MEDIA:
+        return "Media"
+    return "Especulativa"
+
+
+def recommend_picks(rec: dict) -> list:
+    """Mejor selección del modelo en cada mercado para UN partido.
+
+    Devuelve una lista de 'picks' (un dict por mercado) con la probabilidad que
+    el modelo asigna. No consulta cuotas: 'recomendado' = mayor confianza del
+    modelo, no valor frente a una casa de apuestas.
+    """
+    pred = rec["prediction"]
+    home, away = rec["home"]["name"], rec["away"]["name"]
+    picks = []
+
+    # 1) Resultado (1X2): el más probable de los tres.
+    outcomes = [(home, pred["p_home"]), ("Empate", pred["p_draw"]), (away, pred["p_away"])]
+    team, prob = max(outcomes, key=lambda x: x[1])
+    sel = "Empate" if team == "Empate" else f"Gana {team}"
+    picks.append({"market": "Resultado (1X2)", "selection": sel, "prob": prob,
+                  "kind": "1x2", "team": team})
+
+    # 2) Doble oportunidad: la combinación 1X / X2 / 12 más probable.
+    dcs = [
+        (f"{home} o empate", pred["p_home"] + pred["p_draw"], [home, "Empate"]),
+        (f"{away} o empate", pred["p_away"] + pred["p_draw"], [away, "Empate"]),
+        (f"{home} o {away} (sin empate)", pred["p_home"] + pred["p_away"], [home, away]),
+    ]
+    sel, prob, covers = max(dcs, key=lambda x: x[1])
+    picks.append({"market": "Doble oportunidad", "selection": sel, "prob": prob,
+                  "kind": "dc", "covers": covers})
+
+    # 3) Goles Más/Menos 2.5 (el lado más probable).
+    over25 = pred["p_over"][2.5]
+    if over25 >= 0.5:
+        picks.append({"market": "Goles 2.5", "selection": "Más de 2.5", "prob": over25,
+                      "kind": "ou", "line": 2.5, "side": "over"})
+    else:
+        picks.append({"market": "Goles 2.5", "selection": "Menos de 2.5", "prob": 1 - over25,
+                      "kind": "ou", "line": 2.5, "side": "under"})
+
+    # 4) Ambos equipos marcan (BTTS).
+    btts = pred["p_btts"]
+    if btts >= 0.5:
+        picks.append({"market": "Ambos marcan", "selection": "Sí", "prob": btts,
+                      "kind": "btts", "side": "yes"})
+    else:
+        picks.append({"market": "Ambos marcan", "selection": "No", "prob": 1 - btts,
+                      "kind": "btts", "side": "no"})
+
+    # 5) Tiros a puerta del equipo dominante (ESTIMADO; no verificable). Tomamos
+    #    la línea más alta cuya probabilidad (Poisson de media = tiros estimados)
+    #    siga siendo razonable; si ninguna llega, caemos a la línea más baja.
+    if rec["home"]["sot"] >= rec["away"]["sot"]:
+        equipo, mean = home, rec["home"]["sot"]
+    else:
+        equipo, mean = away, rec["away"]["sot"]
+    line, p = 2.5, _poisson_sf(mean, 3)
+    for cand in (4.5, 3.5):
+        pc = _poisson_sf(mean, math.ceil(cand))
+        if pc >= TIER_MEDIA:
+            line, p = cand, pc
+            break
+    picks.append({"market": "Tiros a puerta", "selection": f"{equipo} +{line}", "prob": p,
+                  "kind": "sot", "team": equipo, "line": line})
+
+    for pk in picks:
+        pk["prob"] = float(pk["prob"])
+        pk["tier"] = _tier(pk["prob"])
+    return picks
+
+
+def _grade_pick(pick: dict, actual: dict):
+    """True/False si el pick acertó; None si no es verificable (tiros a puerta)."""
+    kind = pick["kind"]
+    h, a = actual["home"], actual["away"]
+    if kind == "1x2":
+        return actual["winner"] == pick["team"]
+    if kind == "dc":
+        return actual["winner"] in pick["covers"]
+    if kind == "ou":
+        over = (h + a) > pick["line"]
+        return over if pick["side"] == "over" else (not over)
+    if kind == "btts":
+        yes = h >= 1 and a >= 1
+        return yes if pick["side"] == "yes" else (not yes)
+    return None  # tiros a puerta: no hay dato real con que graduar
+
+
+def _build_recommendations(matches: dict) -> list:
+    """Picks recomendados (prob >= CONF_MIN) de los PRÓXIMOS partidos, ordenados."""
+    recs = []
+    for label, m in matches.items():
+        if m["meta"]["status"] != "upcoming":
+            continue
+        for pk in m["picks"]:
+            if pk["prob"] < CONF_MIN:
+                continue
+            recs.append({
+                "label": label, "date": m["meta"]["date"], "group": m["meta"]["group"],
+                "home": m["home"]["name"], "away": m["away"]["name"],
+                "market": pk["market"], "selection": pk["selection"],
+                "prob": pk["prob"], "tier": pk["tier"], "kind": pk["kind"],
+            })
+    recs.sort(key=lambda r: r["prob"], reverse=True)
+    return recs
+
+
+def _backtest(matches: dict) -> dict:
+    """Gradúa los picks recomendados en los partidos JUGADOS (histórico real).
+
+    Usa los picks calculados con las fuerzas PREVIAS al torneo (los partidos
+    jugados se predicen con `ratings_pre`), así que no hay fuga de información.
+    Los tiros a puerta no se gradúan (no hay dato real).
+    """
+    graded = []
+    for m in matches.values():
+        if m["meta"]["status"] != "played":
+            continue
+        for pk in m["picks"]:
+            if pk["prob"] < CONF_MIN:
+                continue
+            res = _grade_pick(pk, m["actual"])
+            if res is None:
+                continue
+            graded.append((pk, res))
+
+    n = len(graded)
+    hits = sum(1 for _, r in graded if r)
+    by_market, by_tier = {}, {}
+    for pk, r in graded:
+        for bucket, key in ((by_market, pk["market"]), (by_tier, pk["tier"])):
+            d = bucket.setdefault(key, {"n": 0, "hits": 0})
+            d["n"] += 1
+            d["hits"] += int(bool(r))
+    for bucket in (by_market, by_tier):
+        for d in bucket.values():
+            d["rate"] = d["hits"] / d["n"] if d["n"] else 0.0
+    return {"n": n, "hits": hits, "rate": hits / n if n else 0.0,
+            "by_market": by_market, "by_tier": by_tier, "conf_min": CONF_MIN}
 
 
 # =============================================================================
@@ -424,18 +623,22 @@ def load_dashboard_data() -> dict:
                 "name": home_name,
                 "xg": pred["xg_home"],
                 "win_prob": pred["p_home"],
+                "sot": pred["sot_home"],
                 "radar": pct.loc[home_name].to_dict(),
             },
             "away": {
                 "name": away_name,
                 "xg": pred["xg_away"],
                 "win_prob": pred["p_away"],
+                "sot": pred["sot_away"],
                 "radar": pct.loc[away_name].to_dict(),
             },
             "prediction": {
                 "p_home": pred["p_home"],
                 "p_draw": pred["p_draw"],
                 "p_away": pred["p_away"],
+                "p_over": pred["p_over"],
+                "p_btts": pred["p_btts"],
                 "favorite": fav,
                 "favorite_prob": outcomes[fav],
                 "most_likely": pred["most_likely"],
@@ -443,6 +646,12 @@ def load_dashboard_data() -> dict:
             },
             "actual": actual,
         }
+        # Mejor pick del modelo por mercado (se calcula sobre el registro ya armado).
+        matches[label]["picks"] = recommend_picks(matches[label])
+
+    # Recomendaciones (próximos) y su histórico de aciertos (jugados).
+    recommendations = _build_recommendations(matches)
+    backtest = _backtest(matches)
 
     meta = {
         "n_matches": len(matches),
@@ -452,9 +661,15 @@ def load_dashboard_data() -> dict:
         "data_through": str(latest.date()) if pd.notna(latest) else "—",
         "gamma": ratings_now.gamma,
         "home_adv": ratings_now.home_adv,
+        "conf_min": CONF_MIN,
         "source": "martj42/international_results",
     }
-    return {"matches": matches, "meta": meta}
+    return {
+        "matches": matches,
+        "meta": meta,
+        "recommendations": recommendations,
+        "backtest": backtest,
+    }
 
 
 # =============================================================================
@@ -475,7 +690,13 @@ def _selftest() -> None:
         assert abs(total - 1.0) < 1e-6, f"Probabilidades no suman 1 en {label}: {total}"
         assert m["home"]["xg"] > 0 and m["away"]["xg"] > 0, f"xG no positivo en {label}"
         assert abs(float(m["prediction"]["matrix"].sum()) - 1.0) < 1e-6
-    print("✓ Probabilidades válidas (suman 1) y xG positivos en los 72 partidos.")
+        # Mercados nuevos: rangos válidos y monotonía de las líneas Más/Menos.
+        assert 0.0 <= p["p_btts"] <= 1.0, f"BTTS fuera de rango en {label}"
+        assert all(0.0 <= v <= 1.0 for v in p["p_over"].values())
+        assert p["p_over"][1.5] >= p["p_over"][2.5] >= p["p_over"][3.5], f"O/U no monótono en {label}"
+        assert m["home"]["sot"] > 0 and m["away"]["sot"] > 0, f"tiros<=0 en {label}"
+        assert m["picks"], f"sin picks en {label}"
+    print("✓ Probabilidades, xG, mercados O/U·BTTS, tiros a puerta y picks OK en los 72 partidos.")
 
     # --- Validación de sensatez: un partido jugado conocido ---
     sample = list(matches.items())[:3] + list(matches.items())[-3:]
@@ -501,6 +722,19 @@ def _selftest() -> None:
     if played:
         print(f"\nAcierto del favorito en partidos jugados: "
               f"{hits}/{len(played)} ({hits/len(played):.0%})")
+
+    # --- Recomendaciones de apuestas y su histórico ---
+    recs, bt = data["recommendations"], data["backtest"]
+    print(f"\nRecomendaciones (próximos, prob≥{CONF_MIN:.0%}): {len(recs)}")
+    for r in recs[:8]:
+        print(f"  {r['prob']:.0%} [{r['tier']:12}] {r['market']:18} "
+              f"{r['selection']:30} · {r['home']} vs {r['away']}")
+    if bt["n"]:
+        print(f"\nBacktest en jugados (prob≥{bt['conf_min']:.0%}): "
+              f"{bt['hits']}/{bt['n']} ({bt['rate']:.0%})")
+        for mkt, d in sorted(bt["by_market"].items()):
+            print(f"    {mkt:18} {d['hits']:>3}/{d['n']:<3} ({d['rate']:.0%})")
+
     print("\n✓ Autotest OK.")
 
 

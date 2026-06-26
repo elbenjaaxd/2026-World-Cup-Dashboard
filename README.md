@@ -2,7 +2,9 @@
 
 App web interactiva que **descarga datos reales** de selecciones nacionales y **predice cada
 partido del Mundial 2026**: goles esperados (xG), probabilidad de victoria/empate, marcador más
-probable y la matriz completa de resultados.
+probable, la matriz completa de resultados, mercados de goles (Más/Menos y "ambos marcan"),
+tiros a puerta estimados y una pestaña de **recomendaciones de apuestas** con su histórico de
+aciertos.
 
 Construida con **Streamlit** + **Pandas** + **Plotly**. El modelo de predicción
 (Poisson/Dixon-Coles) está implementado a mano sobre **NumPy**, así que no requiere scipy ni
@@ -13,8 +15,15 @@ ninguna API de pago.
 - **xG (goles esperados)** de cada equipo en cada partido.
 - **Probabilidades 1 · X · 2** (victoria local / empate / victoria visitante).
 - **Marcador más probable** y un **mapa de calor** con la probabilidad de cada resultado exacto.
+- **Mercados de goles**: Más/Menos 1.5 · 2.5 · 3.5 y **ambos marcan (BTTS)**, calculados de forma
+  exacta a partir de la matriz de marcadores.
+- **Tiros a puerta estimados** por equipo (a partir del xG; ver nota más abajo).
 - **Radar de fuerzas**: ataque, defensa, forma y potencia de cada selección (percentil frente a
   las 48 del torneo).
+- **Pestaña de recomendaciones de apuestas**: la mejor selección del modelo por mercado (resultado,
+  doble oportunidad, Más/Menos 2.5, ambos marcan, tiros a puerta), ordenada por confianza y con
+  filtros. Incluye un **histórico de aciertos** que evalúa, sin fuga de información, cómo habrían
+  rendido esos picks en los partidos ya jugados.
 - Cubre los **72 partidos de fase de grupos**. Los ya jugados muestran el resultado real junto a
   la predicción previa del modelo ("modelo vs. realidad"); los próximos muestran el pronóstico.
 - Filtro por estado (todos / próximos / jugados) y botón para **actualizar los datos**.
@@ -64,6 +73,13 @@ python model.py        # autotest: imprime predicciones de ejemplo y comprobacio
 
 - El **xG** aquí son los goles esperados del modelo (λ de Poisson), no un xG basado en tiros
   (ninguna fuente gratuita publica datos de tiros para estos partidos).
+- Los **tiros a puerta son una estimación** derivada del xG (tiros ≈ xG ÷ 0.30, la tasa media de
+  conversión tiro-a-puerta→gol del fútbol internacional), **no un dato real**. Se intentó FotMob,
+  pero bloqueó su API tras un token, así que no hay tiros reales accesibles para estos partidos.
+- Las **recomendaciones de apuestas** reflejan la **confianza del modelo**, no valor frente a las
+  cuotas de una casa (no se usan cuotas). El histórico muestra que doble oportunidad y 1X2 rinden
+  bien, mientras que Más/Menos 2.5 y BTTS están cerca del azar. **Juega con responsabilidad**: es
+  una herramienta educativa y apostar conlleva riesgo de pérdida.
 - Solo se cubre la **fase de grupos**: los cruces eliminatorios aún no tienen equipos definidos.
 
 ## 📄 Licencia

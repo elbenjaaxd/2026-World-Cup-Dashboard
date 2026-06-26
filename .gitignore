@@ -14,6 +14,7 @@ data/
 
 # --- Backups locales ---
 *.bak
+claude-backup.tar.gz
 
 # --- Artefactos de Windows / WSL ---
 *:Zone.Identifier

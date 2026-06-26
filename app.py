@@ -163,6 +163,32 @@ def build_strength_radar_fig(rec: dict) -> go.Figure:
     return _aplicar_tema_oscuro(fig)
 
 
+def build_goals_markets_fig(rec: dict) -> go.Figure:
+    """Barras horizontales con la probabilidad de los mercados de goles.
+
+    Líneas de Más de 1.5 / 2.5 / 3.5 goles + 'Ambos marcan'. Todas salen de la
+    misma matriz de marcadores Poisson, así que son cálculos exactos del modelo.
+    """
+    pred = rec["prediction"]
+    lineas = [1.5, 2.5, 3.5]
+    categorias = [f"Más de {ln}" for ln in lineas] + ["Ambos marcan"]
+    valores = [pred["p_over"][ln] * 100 for ln in lineas] + [pred["p_btts"] * 100]
+    colores = [COLOR_LOCAL] * len(lineas) + [COLOR_VISITANTE]
+
+    fig = go.Figure(
+        go.Bar(
+            x=valores, y=categorias, orientation="h", marker_color=colores,
+            text=[f"{v:.0f}%" for v in valores], textposition="outside",
+        )
+    )
+    fig.update_layout(
+        title="Mercados de goles (probabilidad del modelo)",
+        xaxis_title="Probabilidad (%)", xaxis_range=[0, 100],
+        yaxis=dict(autorange="reversed"), showlegend=False,
+    )
+    return _aplicar_tema_oscuro(fig)
+
+
 # =============================================================================
 #  3. CAPA DE PRESENTACIÓN (Streamlit)
 # =============================================================================
@@ -226,6 +252,27 @@ def render_kpis(rec: dict) -> None:
     st.divider()
 
 
+def render_markets(rec: dict) -> None:
+    """Mercados de goles (Más/Menos, BTTS) y tiros a puerta estimados."""
+    pred, home, away = rec["prediction"], rec["home"], rec["away"]
+    st.markdown("#### Mercados de goles y tiros a puerta")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric(f"Tiros a puerta · {home['name']}", f"{home['sot']:.1f}")
+    col2.metric(f"Tiros a puerta · {away['name']}", f"{away['sot']:.1f}")
+    col3.metric("Ambos marcan (Sí)", f"{pred['p_btts']:.0%}")
+    col4.metric("Más de 2.5 goles", f"{pred['p_over'][2.5]:.0%}")
+
+    st.plotly_chart(build_goals_markets_fig(rec), width="stretch")
+    st.caption(
+        "Los tiros a puerta son una **estimación** a partir del xG "
+        "(tiros ≈ xG ÷ 0.30); no hay datos reales de tiros para estos partidos. "
+        "Los mercados de goles y 'ambos marcan' sí son cálculos exactos de la "
+        "matriz de marcadores."
+    )
+    st.divider()
+
+
 def render_charts(rec: dict) -> None:
     """Gráficos: barras de probabilidad, mapa de calor de marcadores y radar."""
     st.markdown("#### Visualización de las predicciones")
@@ -280,6 +327,8 @@ def to_tournament_df(matches: dict) -> pd.DataFrame:
             "P(1)": f"{p['p_home']:.0%}",
             "P(X)": f"{p['p_draw']:.0%}",
             "P(2)": f"{p['p_away']:.0%}",
+            "+2.5": f"{p['p_over'][2.5]:.0%}",
+            "BTTS": f"{p['p_btts']:.0%}",
             "+ probable": f"{ml['home']}–{ml['away']}",
             "Real": (f"{m['actual']['home']}–{m['actual']['away']}"
                      if m["actual"] else "—"),
@@ -299,6 +348,83 @@ def render_raw_data(matches: dict, label: str) -> None:
 
         st.markdown("**Torneo completo (72 partidos)**")
         st.dataframe(df.reset_index(drop=True), width="stretch", height=420)
+
+
+# --- Constantes de la pestaña de apuestas ---
+_TIER_ICON = {"Alta": "🟢 Alta", "Media": "🟡 Media", "Especulativa": "🔵 Especulativa"}
+
+
+def render_recommendations(data: dict) -> None:
+    """Pestaña de picks recomendados + histórico de aciertos en lo ya jugado."""
+    recs, bt, meta = data["recommendations"], data["backtest"], data["meta"]
+
+    st.markdown("### 🎯 Recomendaciones de apuestas")
+    st.caption(
+        f"Selecciones de mayor **confianza del modelo** (probabilidad ≥ "
+        f"{meta['conf_min']:.0%}) para los **próximos** partidos. No se comparan "
+        "con cuotas de casas de apuestas: indican la confianza del modelo, no un "
+        "valor garantizado frente al mercado."
+    )
+
+    if not recs:
+        st.info("No hay próximos partidos con picks por encima del umbral de confianza.")
+    else:
+        df = pd.DataFrame(recs)
+        mercados = sorted(df["market"].unique())
+        col_f1, col_f2 = st.columns([3, 2])
+        sel_m = col_f1.multiselect("Mercados:", mercados, default=mercados)
+        min_p = col_f2.slider(
+            "Confianza mínima:", 50, 95, int(meta["conf_min"] * 100), step=1,
+        ) / 100.0
+
+        vista = df[df["market"].isin(sel_m) & (df["prob"] >= min_p)].sort_values(
+            "prob", ascending=False
+        )
+        if vista.empty:
+            st.info("Ningún pick cumple los filtros seleccionados.")
+        else:
+            tabla = pd.DataFrame({
+                "Partido": vista["home"] + "  vs  " + vista["away"],
+                "Fecha": vista["date"],
+                "Grupo": vista["group"],
+                "Mercado": vista["market"],
+                "Selección": vista["selection"],
+                "Prob.": (vista["prob"] * 100).round(0).astype(int).astype(str) + "%",
+                "Confianza": vista["tier"].map(_TIER_ICON),
+            })
+            st.dataframe(tabla.reset_index(drop=True), width="stretch", height=460)
+            st.caption(f"{len(vista)} picks · ordenados por probabilidad del modelo.")
+
+    # --- Histórico: cómo habrían rendido estos picks en lo ya jugado ---
+    st.divider()
+    st.markdown("#### 📈 Rendimiento en partidos ya jugados")
+    if bt["n"] == 0:
+        st.info("Aún no hay partidos jugados para evaluar el histórico de picks.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Picks evaluados", bt["n"])
+        c2.metric("Aciertos", bt["hits"])
+        c3.metric("Tasa de acierto", f"{bt['rate']:.0%}")
+
+        filas = [
+            {"Mercado": m, "Picks": d["n"], "Aciertos": d["hits"],
+             "Acierto": f"{d['rate']:.0%}"}
+            for m, d in sorted(bt["by_market"].items(), key=lambda x: -x[1]["rate"])
+        ]
+        st.dataframe(pd.DataFrame(filas), width="stretch")
+        st.caption(
+            "Picks generados con las fuerzas **previas** al torneo (sin fuga de "
+            "información). Los tiros a puerta no se evalúan (no hay datos reales). "
+            "Nótese que 'Doble oportunidad' y '1X2' rinden muy por encima de "
+            "'Goles 2.5' y 'Ambos marcan', que son mercados cercanos al azar."
+        )
+
+    st.divider()
+    st.warning(
+        "⚠️ **Juega con responsabilidad.** Estas recomendaciones son la salida de "
+        "un modelo estadístico con fines educativos; no garantizan resultados y no "
+        "consideran las cuotas del mercado. Apostar conlleva riesgo de pérdida."
+    )
 
 
 # =============================================================================
@@ -360,12 +486,19 @@ def main() -> None:
         "xG = goles esperados del modelo."
     )
 
-    # --- Render del dashboard principal ---
-    render_header(label, rec)
-    render_kpis(rec)
-    render_evaluation(rec)
-    render_charts(rec)
-    render_raw_data(matches, label)
+    # --- Render: dos pestañas (análisis del partido / recomendaciones) ---
+    tab_partido, tab_apuestas = st.tabs(
+        ["📊 Análisis del partido", "🎯 Recomendaciones de apuestas"]
+    )
+    with tab_partido:
+        render_header(label, rec)
+        render_kpis(rec)
+        render_markets(rec)
+        render_evaluation(rec)
+        render_charts(rec)
+        render_raw_data(matches, label)
+    with tab_apuestas:
+        render_recommendations(data)
 
 
 if __name__ == "__main__":
