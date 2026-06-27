@@ -370,21 +370,30 @@ def render_recommendations(data: dict) -> None:
         st.info("No hay próximos partidos con picks por encima del umbral de confianza.")
     else:
         df = pd.DataFrame(recs)
+        df["partido"] = df["home"] + "  vs  " + df["away"]
         mercados = sorted(df["market"].unique())
+        partidos = list(dict.fromkeys(df["partido"]))  # mantiene el orden por prob.
+
+        sel_p = st.multiselect(
+            "Partidos:", partidos, default=partidos,
+            help="Filtra para ver solo el/los partido(s) que te interesan.",
+        )
         col_f1, col_f2 = st.columns([3, 2])
         sel_m = col_f1.multiselect("Mercados:", mercados, default=mercados)
         min_p = col_f2.slider(
             "Confianza mínima:", 50, 95, int(meta["conf_min"] * 100), step=1,
         ) / 100.0
 
-        vista = df[df["market"].isin(sel_m) & (df["prob"] >= min_p)].sort_values(
-            "prob", ascending=False
-        )
+        vista = df[
+            df["partido"].isin(sel_p)
+            & df["market"].isin(sel_m)
+            & (df["prob"] >= min_p)
+        ].sort_values("prob", ascending=False)
         if vista.empty:
             st.info("Ningún pick cumple los filtros seleccionados.")
         else:
             tabla = pd.DataFrame({
-                "Partido": vista["home"] + "  vs  " + vista["away"],
+                "Partido": vista["partido"],
                 "Fecha": vista["date"],
                 "Grupo": vista["group"],
                 "Mercado": vista["market"],
